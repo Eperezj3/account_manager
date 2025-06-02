@@ -1,0 +1,4 @@
+requests
+pydantic
+polars==1.21.0
+pyarrow
