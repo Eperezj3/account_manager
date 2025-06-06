@@ -1,5 +1,5 @@
 from itertools import islice
-
+from multiprocessing import Pool
 from pydantic import BaseModel, UUID4, validator
 from typing import List, Literal, Optional, Dict
 import requests
@@ -8,7 +8,7 @@ from requests.exceptions import HTTPError
 import json
 
 
-def check_account_providers(user_id: str) -> Dict:
+def check_account_providers(user_id: str) -> Optional[Dict]:
     base_url = f'http://api.live.klar.internal.io/accounts/internal/v3/users/{user_id}'
     req = requests.get(
         url=base_url,
@@ -18,13 +18,13 @@ def check_account_providers(user_id: str) -> Dict:
         req.raise_for_status()
         res = req.json()
     except HTTPError:
-        print(f'Error retrieving cards for {user_id}!')
+        print(f'Error retrieving accounts for {user_id}!')
         res = None
 
     return res
 
 
-def check_cards(parabilium_internal_id: str) -> Dict:
+def check_cards(parabilium_internal_id: str) -> Optional[Dict]:
     base_url = f'http://api.live.klar.internal.io/provider-parabilium/cs/cards?'
     params = {
         'accountId': parabilium_internal_id
@@ -162,7 +162,7 @@ class UserCard(BaseModel):
 
 class UserAccount(BaseModel):
     user_id: UUID4
-    parabilium_account_id: Optional[UUID4]
+    parabilium_account_id: str
     active_spei: List[UUID4]
     has_mobile_access: Optional[bool]
     cards: List[UserCard]
@@ -287,13 +287,18 @@ class AccountManager:
 
         return response
 
-    def create_user_instance(self, *user_id) -> None:
+    def create_user_instance(self, *user_id) -> Dict:
         mobile_access = self.check_mobile_access(*user_id)
+        instances = {}
 
         for user in user_id:
             account_providers = check_account_providers(user_id=user)
 
-            parabilium_internal_id = ''
+            if account_providers is None:
+                instances[user] = None
+                continue
+
+            parabilium_internal_id = 'not_found'
             spei = []
             for account in account_providers['accounts']:
                 provider = account.get('providerId', None)
@@ -304,8 +309,16 @@ class AccountManager:
                 if provider == 'PARABILIUM':
                     parabilium_internal_id = account.get('internalId', None)
 
+            if parabilium_internal_id == 'not_found':
+                cards = []
+            else:
+                cards = check_cards(parabilium_internal_id=parabilium_internal_id)
+
+            if cards is None:
+                instances[user] = None
+                continue
+
             user_cards = []
-            cards = check_cards(parabilium_internal_id=parabilium_internal_id)
             for card in cards:
                 current_card = UserCard(
                     user_id=user,
@@ -315,13 +328,34 @@ class AccountManager:
                 )
                 user_cards.append(current_card)
 
-            self.users[user] = UserAccount(
+            instances[user] = UserAccount(
                 user_id=user,
                 parabilium_account_id=parabilium_internal_id,
                 active_spei=spei,
                 has_mobile_access=mobile_access[user],
                 cards=user_cards
             )
+        return instances
+
+    def create_user_instances(self, chunk):
+        return self.create_user_instance(*chunk)
+
+    def create_user_instance_batch(self, *user_id, batch_size: int = 50, n_process: int = 4) -> List[Dict]:
+        user_id_ = iter(user_id)
+        chunks = [
+            list(islice(user_id_, batch_size)) for _ in range((len(user_id) + batch_size - 1) // batch_size)
+        ]
+
+        with Pool(processes=n_process) as pool_:
+            results = pool_.map(
+                self.create_user_instances,
+                chunks
+            )
+
+        for dictionary in results:
+            self.users.update(dictionary)
+
+        return results
 
     def refresh_all_data(self):
         users_to_refresh = list(self.users.keys())
